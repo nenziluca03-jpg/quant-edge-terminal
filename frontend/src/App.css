@@ -1,0 +1,4 @@
+/* Root app-level overrides are in index.css. Keep this minimal. */
+.App {
+  min-height: 100vh;
+}
