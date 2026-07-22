@@ -14,18 +14,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from cachetools import TTLCache
 import requests
-
-# ------------------------------------------------------------------
-# SESSIONE CON USER-AGENT (EVITA GLI ERRORE 429 DI YAHOO FINANCE)
-# ------------------------------------------------------------------
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
-
-# Cache globale da 200 elementi, i dati durano 5 minuti (300 secondi)
-cache = TTLCache(maxsize=200, ttl=300)
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -35,6 +23,25 @@ load_dotenv(ROOT_DIR / ".env")
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 
+# ------------------------------------------------------------------
+# SESSIONE CON USER-AGENT & CACHE (ANTI 429 YAHOO FINANCE)
+# ------------------------------------------------------------------
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+})
+
+cache = TTLCache(maxsize=300, ttl=300)
+
+def _cache_get(key: str):
+    return cache.get(key)
+
+def _cache_set(key: str, payload: Any):
+    cache[key] = payload
+
+# ------------------------------------------------------------------
+# APP & ROUTER CONFIG
+# ------------------------------------------------------------------
 app = FastAPI(title="QUANT-EDGE Terminal API", version="2.0")
 api = APIRouter(prefix="/api")
 
@@ -42,7 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("quant-edge")
 
 # ------------------------------------------------------------------
-# 1. Utils
+# UTILS
 # ------------------------------------------------------------------
 def _safe_row(df: pd.DataFrame, keys: List[str], col_idx: int = 0) -> float:
     if df is None or df.empty:
@@ -58,7 +65,6 @@ def _safe_row(df: pd.DataFrame, keys: List[str], col_idx: int = 0) -> float:
                 continue
     return 0.0
 
-
 def _series_row(df: pd.DataFrame, keys: List[str]) -> List[float]:
     if df is None or df.empty:
         return []
@@ -69,7 +75,6 @@ def _series_row(df: pd.DataFrame, keys: List[str]) -> List[float]:
             except Exception:
                 continue
     return []
-
 
 def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
     try:
@@ -83,25 +88,17 @@ def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
         pass
     return float(info.get("previousClose") or 100.0)
 
-
-# Helper per la cache unificata
-def _cache_get(key: str):
-    return cache.get(key)
-
-
-def _cache_set(key: str, payload):
-    cache[key] = payload
-
-
 # ------------------------------------------------------------------
-# 2. Data endpoint
+# ENDPOINTS API (/api/...)
 # ------------------------------------------------------------------
 @api.get("/asset/{ticker}")
 async def get_asset(ticker: str):
     ticker = ticker.upper().strip()
-    cached = _cache_get(f"asset:{ticker}")
+    cache_key = f"asset:{ticker}"
+    cached = _cache_get(cache_key)
     if cached:
         return cached
+
     try:
         t = yf.Ticker(ticker, session=session)
         info = t.info or {}
@@ -152,7 +149,7 @@ async def get_asset(ticker: str):
             "currency": info.get("currency") or "USD",
             "exchange": info.get("exchange") or "N/A",
             "website": info.get("website") or "",
-            "summary": info.get("longBusinessSummary") or "Descrizione societaria non disponibile.",
+            "summary": info.get("longBusinessSummary") or "Descrizione non disponibile.",
             "live_price": live,
             "previous_close": float(info.get("previousClose") or live),
             "day_high": float(info.get("dayHigh") or live),
@@ -196,24 +193,22 @@ async def get_asset(ticker: str):
             "net_income_history": ni_hist,
             "price_history": price_hist,
         }
-        _cache_set(f"asset:{ticker}", payload)
+        _cache_set(cache_key, payload)
         return payload
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("asset fetch failed")
-        raise HTTPException(status_code=500, detail=f"Errore: {e}")
+        log.exception("Asset fetch failed")
+        raise HTTPException(status_code=500, detail=f"Errore recupero asset: {e}")
 
-
-# ------------------------------------------------------------------
-# 3. News
-# ------------------------------------------------------------------
 @api.get("/news/{ticker}")
 async def news(ticker: str, limit: int = 8):
-    key = f"news:{ticker}:{limit}"
-    cached = _cache_get(key)
+    ticker = ticker.upper().strip()
+    cache_key = f"news:{ticker}:{limit}"
+    cached = _cache_get(cache_key)
     if cached:
         return cached
+
     articles = []
     try:
         q = urllib.parse.quote(f"{ticker} stock")
@@ -233,19 +228,18 @@ async def news(ticker: str, limit: int = 8):
                 "published": pub.text if pub is not None else "",
             })
     except Exception as e:
-        log.warning("news failed: %s", e)
-    _cache_set(key, articles)
+        log.warning("News failed: %s", e)
+
+    _cache_set(cache_key, articles)
     return articles
 
-
-# ------------------------------------------------------------------
-# 4. Macro
-# ------------------------------------------------------------------
 @api.get("/macro")
 async def macro():
-    cached = _cache_get("macro:all")
+    cache_key = "macro:all"
+    cached = _cache_get(cache_key)
     if cached:
         return cached
+
     series = [
         ("^TNX", "US 10Y Yield"),
         ("^FVX", "US 5Y Yield"),
@@ -275,13 +269,13 @@ async def macro():
             if last:
                 out.append({"id": sym, "name": name, "value": last, "date": datetime.now(timezone.utc).strftime("%Y-%m-%d")})
         except Exception as e:
-            log.warning("macro %s failed: %s", sym, e)
-    _cache_set("macro:all", out)
+            log.warning("Macro %s failed: %s", sym, e)
+
+    _cache_set(cache_key, out)
     return out
 
-
 # ------------------------------------------------------------------
-# 5. Valuation engine
+# VALUATIONS & MODELS
 # ------------------------------------------------------------------
 class ValuationRequest(BaseModel):
     ticker: str
@@ -308,7 +302,6 @@ class ValuationRequest(BaseModel):
     net_income: Optional[float] = 0.0
     dividend_rate: Optional[float] = 0.0
 
-
 def _three_stage_dcf(base_flow, wacc, g1, g2, perp, exit_mult, shares, net_debt, ebitda):
     flows = []
     disc = []
@@ -333,14 +326,12 @@ def _three_stage_dcf(base_flow, wacc, g1, g2, perp, exit_mult, shares, net_debt,
     val_exit = ((pv_stages + pv_tv_exit) - net_debt) / shares if shares else float("nan")
     return val_gordon, val_exit, flows, disc
 
-
 def _clean(x):
     if x is None:
         return None
     if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
         return None
     return x
-
 
 @api.post("/valuation")
 async def valuation(req: ValuationRequest):
@@ -442,16 +433,11 @@ async def valuation(req: ValuationRequest):
         },
     }
 
-
-# ------------------------------------------------------------------
-# 6. Monte Carlo
-# ------------------------------------------------------------------
 class MonteCarloRequest(ValuationRequest):
     n_sims: int = 2000
     growth_vol: float = 0.035
     wacc_vol: float = 0.012
     seed: int = 42
-
 
 @api.post("/montecarlo")
 async def montecarlo(req: MonteCarloRequest):
@@ -509,15 +495,10 @@ async def montecarlo(req: MonteCarloRequest):
         "histogram": bins,
     }
 
-
-# ------------------------------------------------------------------
-# 7. Sensitivity Heatmap
-# ------------------------------------------------------------------
 class SensitivityRequest(ValuationRequest):
     wacc_range: float = 0.03
     growth_range: float = 0.05
     steps: int = 7
-
 
 @api.post("/sensitivity")
 async def sensitivity(req: SensitivityRequest):
@@ -553,14 +534,11 @@ async def sensitivity(req: SensitivityRequest):
         "market_price": req.live_price,
     }
 
-
-# ------------------------------------------------------------------
-# 8. Peer Benchmarking
-# ------------------------------------------------------------------
 @api.get("/peers/{ticker}")
 async def peers(ticker: str):
     ticker = ticker.upper().strip()
-    cached = _cache_get(f"peers:{ticker}")
+    cache_key = f"peers:{ticker}"
+    cached = _cache_get(cache_key)
     if cached:
         return cached
 
@@ -631,15 +609,11 @@ async def peers(ticker: str):
         "profit_margin": _median("profit_margin"),
         "revenue_growth": _median("revenue_growth"),
     }
-    
+
     payload = {"rows": rows, "peer_medians": medians}
-    _cache_set(f"peers:{ticker}", payload)
+    _cache_set(cache_key, payload)
     return payload
 
-
-# ------------------------------------------------------------------
-# 9. AI Research Narrative (Streaming SSE)
-# ------------------------------------------------------------------
 class AIResearchRequest(BaseModel):
     ticker: str
     name: str
@@ -662,7 +636,6 @@ class AIResearchRequest(BaseModel):
     prob_undervalued: Optional[float] = None
     var_95: Optional[float] = None
     language: str = "it"
-
 
 @api.post("/ai/research")
 async def ai_research(req: AIResearchRequest):
@@ -730,14 +703,12 @@ async def ai_research(req: AIResearchRequest):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
-
 # ------------------------------------------------------------------
-# 10. Health
+# BASE ROUTE & MOUNT
 # ------------------------------------------------------------------
-@api.get("/")
+@app.get("/")
 async def root():
     return {"service": "QUANT-EDGE Terminal", "version": "2.0", "status": "operational"}
-
 
 app.include_router(api)
 
