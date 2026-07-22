@@ -12,8 +12,7 @@ from typing import List, Optional, Dict, Any
 import os, math, json, logging, asyncio, urllib.request, urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from cachetools import TTLCache
-import requests
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -23,25 +22,6 @@ load_dotenv(ROOT_DIR / ".env")
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 
-# ------------------------------------------------------------------
-# SESSIONE CON USER-AGENT & CACHE (ANTI 429 YAHOO FINANCE)
-# ------------------------------------------------------------------
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
-
-cache = TTLCache(maxsize=300, ttl=300)
-
-def _cache_get(key: str):
-    return cache.get(key)
-
-def _cache_set(key: str, payload: Any):
-    cache[key] = payload
-
-# ------------------------------------------------------------------
-# APP & ROUTER CONFIG
-# ------------------------------------------------------------------
 app = FastAPI(title="QUANT-EDGE Terminal API", version="2.0")
 api = APIRouter(prefix="/api")
 
@@ -49,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("quant-edge")
 
 # ------------------------------------------------------------------
-# UTILS
+# 1. Utils
 # ------------------------------------------------------------------
 def _safe_row(df: pd.DataFrame, keys: List[str], col_idx: int = 0) -> float:
     if df is None or df.empty:
@@ -65,6 +45,7 @@ def _safe_row(df: pd.DataFrame, keys: List[str], col_idx: int = 0) -> float:
                 continue
     return 0.0
 
+
 def _series_row(df: pd.DataFrame, keys: List[str]) -> List[float]:
     if df is None or df.empty:
         return []
@@ -76,31 +57,52 @@ def _series_row(df: pd.DataFrame, keys: List[str]) -> List[float]:
                 continue
     return []
 
+
 def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
     try:
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
-        if price:
-            return float(price)
-        h = t.history(period="1d")
+        h = t.history(period="1d", interval="1m")
         if not h.empty:
             return float(h["Close"].iloc[-1])
     except Exception:
         pass
-    return float(info.get("previousClose") or 100.0)
+    try:
+        h = t.history(period="5d")
+        if not h.empty:
+            return float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+    return float(info.get("currentPrice") or info.get("regularMarketPrice") or 100.0)
+
 
 # ------------------------------------------------------------------
-# ENDPOINTS API (/api/...)
+# 2. Data endpoint
 # ------------------------------------------------------------------
+_CACHE: Dict[str, Any] = {}
+_CACHE_TTL = 300  # seconds
+
+
+def _cache_get(key: str):
+    v = _CACHE.get(key)
+    if not v:
+        return None
+    ts, payload = v
+    if (datetime.now(timezone.utc) - ts).total_seconds() > _CACHE_TTL:
+        return None
+    return payload
+
+
+def _cache_set(key: str, payload):
+    _CACHE[key] = (datetime.now(timezone.utc), payload)
+
+
 @api.get("/asset/{ticker}")
 async def get_asset(ticker: str):
     ticker = ticker.upper().strip()
-    cache_key = f"asset:{ticker}"
-    cached = _cache_get(cache_key)
+    cached = _cache_get(f"asset:{ticker}")
     if cached:
         return cached
-
     try:
-        t = yf.Ticker(ticker, session=session)
+        t = yf.Ticker(ticker)
         info = t.info or {}
         if not info or not (info.get("shortName") or info.get("longName")):
             raise HTTPException(status_code=404, detail=f"Ticker {ticker} non trovato.")
@@ -127,9 +129,11 @@ async def get_asset(ticker: str):
         shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding") or 1_000_000_000
         beta = info.get("beta") or 1.15
 
+        # Historical revenue series (up to 4y)
         rev_hist = _series_row(is_df, ["Total Revenue", "TotalRevenue"])
         ni_hist = _series_row(is_df, ["Net Income", "NetIncome"])
 
+        # Price history 1Y
         try:
             hist = t.history(period="1y")
             price_hist = [
@@ -149,7 +153,7 @@ async def get_asset(ticker: str):
             "currency": info.get("currency") or "USD",
             "exchange": info.get("exchange") or "N/A",
             "website": info.get("website") or "",
-            "summary": info.get("longBusinessSummary") or "Descrizione non disponibile.",
+            "summary": info.get("longBusinessSummary") or "Descrizione societaria non disponibile.",
             "live_price": live,
             "previous_close": float(info.get("previousClose") or live),
             "day_high": float(info.get("dayHigh") or live),
@@ -193,22 +197,24 @@ async def get_asset(ticker: str):
             "net_income_history": ni_hist,
             "price_history": price_hist,
         }
-        _cache_set(cache_key, payload)
+        _cache_set(f"asset:{ticker}", payload)
         return payload
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("Asset fetch failed")
-        raise HTTPException(status_code=500, detail=f"Errore recupero asset: {e}")
+        log.exception("asset fetch failed")
+        raise HTTPException(status_code=500, detail=f"Errore: {e}")
 
+
+# ------------------------------------------------------------------
+# 3. News
+# ------------------------------------------------------------------
 @api.get("/news/{ticker}")
 async def news(ticker: str, limit: int = 8):
-    ticker = ticker.upper().strip()
-    cache_key = f"news:{ticker}:{limit}"
-    cached = _cache_get(cache_key)
+    key = f"news:{ticker}:{limit}"
+    cached = _cache_get(key)
     if cached:
         return cached
-
     articles = []
     try:
         q = urllib.parse.quote(f"{ticker} stock")
@@ -228,18 +234,20 @@ async def news(ticker: str, limit: int = 8):
                 "published": pub.text if pub is not None else "",
             })
     except Exception as e:
-        log.warning("News failed: %s", e)
-
-    _cache_set(cache_key, articles)
+        log.warning("news failed: %s", e)
+    _cache_set(key, articles)
     return articles
 
+
+# ------------------------------------------------------------------
+# 4. Macro (FRED — free, no key needed via fredgraph CSV)
+# ------------------------------------------------------------------
 @api.get("/macro")
 async def macro():
-    cache_key = "macro:all"
-    cached = _cache_get(cache_key)
+    """Fetch macro indicators via yfinance (free, no key)."""
+    cached = _cache_get("macro:all")
     if cached:
         return cached
-
     series = [
         ("^TNX", "US 10Y Yield"),
         ("^FVX", "US 5Y Yield"),
@@ -255,52 +263,58 @@ async def macro():
     out = []
     for sym, name in series:
         try:
-            t = yf.Ticker(sym, session=session)
-            info = t.fast_info
+            info = yf.Ticker(sym).fast_info
             last = None
             try:
                 last = float(info.get("last_price") or info.get("lastPrice") or 0)
             except Exception:
                 pass
             if not last:
-                h = t.history(period="2d")
+                h = yf.Ticker(sym).history(period="2d")
                 if not h.empty:
                     last = float(h["Close"].iloc[-1])
             if last:
                 out.append({"id": sym, "name": name, "value": last, "date": datetime.now(timezone.utc).strftime("%Y-%m-%d")})
         except Exception as e:
-            log.warning("Macro %s failed: %s", sym, e)
-
-    _cache_set(cache_key, out)
+            log.warning("macro %s failed: %s", sym, e)
+    _cache_set("macro:all", out)
     return out
 
+
 # ------------------------------------------------------------------
-# VALUATIONS & MODELS
+# 5. Valuation engine
 # ------------------------------------------------------------------
 class ValuationRequest(BaseModel):
     ticker: str
+    # Overrides
     ebit: float
     capex: float
     nwc_change: float
     net_debt: float
     da: float
+    # WACC
     rf_rate: float
     erp: float
     tax_rate: float
     cost_of_debt: float
     beta: float
+    # Growth
     g_stage_1: float
     g_stage_2: float
     perp_g: float
     exit_multiple: float
+    # market context
     live_price: float
     shares_outstanding: float
+    # Optional peer multiples for comps
     peer_pe: Optional[float] = None
     peer_ev_ebitda: Optional[float] = None
     peer_ps: Optional[float] = None
     revenue: Optional[float] = 0.0
     net_income: Optional[float] = 0.0
+    # Dividend model
     dividend_rate: Optional[float] = 0.0
+
 
 def _three_stage_dcf(base_flow, wacc, g1, g2, perp, exit_mult, shares, net_debt, ebitda):
     flows = []
@@ -326,6 +340,7 @@ def _three_stage_dcf(base_flow, wacc, g1, g2, perp, exit_mult, shares, net_debt,
     val_exit = ((pv_stages + pv_tv_exit) - net_debt) / shares if shares else float("nan")
     return val_gordon, val_exit, flows, disc
 
+
 def _clean(x):
     if x is None:
         return None
@@ -333,8 +348,10 @@ def _clean(x):
         return None
     return x
 
+
 @api.post("/valuation")
 async def valuation(req: ValuationRequest):
+    # WACC
     mcap = req.live_price * req.shares_outstanding
     debt_pos = max(0.0, req.net_debt)
     total_cap = mcap + debt_pos
@@ -344,6 +361,7 @@ async def valuation(req: ValuationRequest):
     kd_at = req.cost_of_debt * (1 - req.tax_rate)
     wacc = w_e * ke + w_d * kd_at
 
+    # FCFF
     nopat = req.ebit * (1 - req.tax_rate)
     fcff = nopat + req.da - req.capex + req.nwc_change
     ebitda = req.ebit + req.da
@@ -353,6 +371,7 @@ async def valuation(req: ValuationRequest):
         req.shares_outstanding, req.net_debt, ebitda,
     )
 
+    # Reverse DCF — solve for implied g1
     def _price_for_g1(g1):
         _, ve, _, _ = _three_stage_dcf(
             fcff, wacc, g1, req.g_stage_2, req.perp_g, req.exit_multiple,
@@ -370,10 +389,12 @@ async def valuation(req: ValuationRequest):
             hi = mid
     implied_g = mid
 
+    # DDM (Gordon) — only meaningful if dividend > 0
     ddm_val = None
     if req.dividend_rate and req.dividend_rate > 0 and ke > req.perp_g:
         ddm_val = (req.dividend_rate * (1 + req.perp_g)) / (ke - req.perp_g)
 
+    # Multiples-based valuations
     multiples = {}
     if req.peer_pe and req.net_income and req.shares_outstanding:
         eps = req.net_income / req.shares_outstanding
@@ -384,6 +405,7 @@ async def valuation(req: ValuationRequest):
     if req.peer_ps and req.revenue and req.shares_outstanding:
         multiples["ps"] = (req.peer_ps * req.revenue) / req.shares_outstanding
 
+    # Weighted composite target
     components = []
     if _clean(v_exit) is not None:
         components.append(("DCF Exit Multiple", v_exit, 0.35))
@@ -433,11 +455,16 @@ async def valuation(req: ValuationRequest):
         },
     }
 
+
+# ------------------------------------------------------------------
+# 6. Monte Carlo
+# ------------------------------------------------------------------
 class MonteCarloRequest(ValuationRequest):
     n_sims: int = 2000
     growth_vol: float = 0.035
     wacc_vol: float = 0.012
     seed: int = 42
+
 
 @api.post("/montecarlo")
 async def montecarlo(req: MonteCarloRequest):
@@ -472,10 +499,12 @@ async def montecarlo(req: MonteCarloRequest):
     trimmed = finite[(finite >= lo) & (finite <= hi)]
     p_under = float((trimmed > req.live_price).mean() * 100)
 
+    # VaR / CVaR on returns vs market price
     returns = (trimmed - req.live_price) / req.live_price
     var_95 = float(np.quantile(returns, 0.05))
     cvar_95 = float(returns[returns <= var_95].mean()) if (returns <= var_95).any() else var_95
 
+    # Histogram bins
     hist, edges = np.histogram(trimmed, bins=40)
     bins = [{"x": float((edges[i] + edges[i + 1]) / 2), "y": int(hist[i])} for i in range(len(hist))]
 
@@ -495,10 +524,15 @@ async def montecarlo(req: MonteCarloRequest):
         "histogram": bins,
     }
 
+
+# ------------------------------------------------------------------
+# 7. Sensitivity Heatmap
+# ------------------------------------------------------------------
 class SensitivityRequest(ValuationRequest):
     wacc_range: float = 0.03
     growth_range: float = 0.05
     steps: int = 7
+
 
 @api.post("/sensitivity")
 async def sensitivity(req: SensitivityRequest):
@@ -534,14 +568,14 @@ async def sensitivity(req: SensitivityRequest):
         "market_price": req.live_price,
     }
 
+
+# ------------------------------------------------------------------
+# 8. Peer Benchmarking
+# ------------------------------------------------------------------
 @api.get("/peers/{ticker}")
 async def peers(ticker: str):
     ticker = ticker.upper().strip()
-    cache_key = f"peers:{ticker}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-
+    # Static curated peer map (free, no external calls) — fallback + curated for popular tickers
     peer_map = {
         "TSLA": ["F", "GM", "STLA", "TM", "NIO", "LI", "RIVN", "LCID"],
         "AAPL": ["MSFT", "GOOGL", "META", "AMZN", "SAMSUNG", "SONY"],
@@ -559,7 +593,7 @@ async def peers(ticker: str):
     peers_list = peer_map.get(ticker, [])
     if not peers_list:
         try:
-            t = yf.Ticker(ticker, session=session)
+            t = yf.Ticker(ticker)
             info = t.info or {}
             sector = info.get("sector") or ""
             defaults = {
@@ -577,7 +611,7 @@ async def peers(ticker: str):
     rows = []
     for sym in [ticker] + peers_list[:6]:
         try:
-            info = yf.Ticker(sym, session=session).info or {}
+            info = yf.Ticker(sym).info or {}
             rows.append({
                 "ticker": sym,
                 "name": info.get("shortName") or sym,
@@ -596,6 +630,7 @@ async def peers(ticker: str):
         except Exception:
             continue
 
+    # Median peer multiples (excluding target)
     peers_only = [r for r in rows if not r["is_target"]]
     def _median(key):
         vs = [r[key] for r in peers_only if r.get(key)]
@@ -609,11 +644,12 @@ async def peers(ticker: str):
         "profit_margin": _median("profit_margin"),
         "revenue_growth": _median("revenue_growth"),
     }
+    return {"rows": rows, "peer_medians": medians}
 
-    payload = {"rows": rows, "peer_medians": medians}
-    _cache_set(cache_key, payload)
-    return payload
 
+# ------------------------------------------------------------------
+# 9. AI Research Narrative (Streaming SSE)
+# ------------------------------------------------------------------
 class AIResearchRequest(BaseModel):
     ticker: str
     name: str
@@ -635,7 +671,8 @@ class AIResearchRequest(BaseModel):
     beta: float
     prob_undervalued: Optional[float] = None
     var_95: Optional[float] = None
-    language: str = "it"
+    language: str = "it"  # "it" or "en"
+
 
 @api.post("/ai/research")
 async def ai_research(req: AIResearchRequest):
@@ -703,12 +740,14 @@ async def ai_research(req: AIResearchRequest):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
+
 # ------------------------------------------------------------------
-# BASE ROUTE & MOUNT
+# 10. Health
 # ------------------------------------------------------------------
-@app.get("/")
+@api.get("/")
 async def root():
     return {"service": "QUANT-EDGE Terminal", "version": "2.0", "status": "operational"}
+
 
 app.include_router(api)
 
@@ -719,8 +758,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-        
-        _cache_set(cache_key, default_peers)
-        return default_peers
-    except Exception:
-        return ["AAPL", "MSFT", "GOOGL"]
