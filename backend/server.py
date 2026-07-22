@@ -12,7 +12,10 @@ from typing import List, Optional, Dict, Any
 import os, math, json, logging, asyncio, urllib.request, urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from cachetools import TTLCache
 
+# Cache da 100 elementi, i dati durano 5 minuti (300 secondi)
+cache = TTLCache(maxsize=100, ttl=300)
 import numpy as np
 import pandas as pd
 import yfinance as yf
