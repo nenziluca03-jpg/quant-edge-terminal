@@ -33,11 +33,11 @@ def _cache_set(key: str, value: Any):
     cache[key] = value
 
 # ------------------------------------------------------------------------------
-# FASTAPI APP
+# FASTAPI APP (Rinominata in 'app' per Render)
 # ------------------------------------------------------------------------------
-api = FastAPI(title="Quant Edge Terminal API", version="1.1.0")
+app = FastAPI(title="Quant Edge Terminal API", version="1.1.0")
 
-api.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -50,7 +50,6 @@ api.add_middleware(
 # ------------------------------------------------------------------------------
 def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
     try:
-        # Usa prima i dati già presenti in info per evitare chiamate di rete extra (evita 429)
         price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
         if price:
             return float(price)
@@ -66,11 +65,11 @@ def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
 # ------------------------------------------------------------------------------
 # ENDPOINTS
 # ------------------------------------------------------------------------------
-@api.get("/")
+@app.get("/")
 def root():
     return {"status": "ok", "message": "Quant Edge Terminal Backend Operational"}
 
-@api.get("/asset/{ticker}")
+@app.get("/asset/{ticker}")
 def get_asset(ticker: str):
     ticker = ticker.upper().strip()
     cache_key = f"asset:{ticker}"
@@ -112,7 +111,7 @@ def get_asset(ticker: str):
         log.error("Errore recupero asset %s: %s", ticker, e)
         raise HTTPException(status_code=429, detail="Impossibile recuperare i dati al momento (Rate Limit Yahoo). Riprova tra 1-2 minuti.")
 
-@api.get("/news/{ticker}")
+@app.get("/news/{ticker}")
 def get_news(ticker: str):
     ticker = ticker.upper().strip()
     cache_key = f"news:{ticker}"
@@ -141,7 +140,7 @@ def get_news(ticker: str):
         log.error("Errore recupero news per %s: %s", ticker, e)
         return []
 
-@api.get("/macro")
+@app.get("/macro")
 def get_macro():
     cache_key = "macro_indicators"
     cached_data = _cache_get(cache_key)
@@ -175,7 +174,7 @@ def get_macro():
     _cache_set(cache_key, results)
     return results
 
-@api.get("/peers/{ticker}")
+@app.get("/peers/{ticker}")
 def get_peers(ticker: str):
     ticker = ticker.upper().strip()
     cache_key = f"peers:{ticker}"
@@ -189,8 +188,12 @@ def get_peers(ticker: str):
         info = t.info or {}
         sector = info.get("sector")
         
-        # Mappa base di peers se non ricavabili in automatico
         default_peers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+        
+        _cache_set(cache_key, default_peers)
+        return default_peers
+    except Exception:
+        return ["AAPL", "MSFT", "GOOGL"]
         
         _cache_set(cache_key, default_peers)
         return default_peers
