@@ -14,8 +14,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from cachetools import TTLCache
 
-# Cache da 100 elementi, i dati durano 5 minuti (300 secondi)
-cache = TTLCache(maxsize=100, ttl=300)
+# Cache globale da 200 elementi, i dati durano 5 minuti (300 secondi)
+cache = TTLCache(maxsize=200, ttl=300)
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -77,27 +78,18 @@ def _fetch_live_price(t: yf.Ticker, info: dict) -> float:
     return float(info.get("currentPrice") or info.get("regularMarketPrice") or 100.0)
 
 
-# ------------------------------------------------------------------
-# 2. Data endpoint
-# ------------------------------------------------------------------
-_CACHE: Dict[str, Any] = {}
-_CACHE_TTL = 300  # seconds
-
-
+# Helper per la cache unificata
 def _cache_get(key: str):
-    v = _CACHE.get(key)
-    if not v:
-        return None
-    ts, payload = v
-    if (datetime.now(timezone.utc) - ts).total_seconds() > _CACHE_TTL:
-        return None
-    return payload
+    return cache.get(key)
 
 
 def _cache_set(key: str, payload):
-    _CACHE[key] = (datetime.now(timezone.utc), payload)
+    cache[key] = payload
 
 
+# ------------------------------------------------------------------
+# 2. Data endpoint
+# ------------------------------------------------------------------
 @api.get("/asset/{ticker}")
 async def get_asset(ticker: str):
     ticker = ticker.upper().strip()
@@ -289,33 +281,27 @@ async def macro():
 # ------------------------------------------------------------------
 class ValuationRequest(BaseModel):
     ticker: str
-    # Overrides
     ebit: float
     capex: float
     nwc_change: float
     net_debt: float
     da: float
-    # WACC
     rf_rate: float
     erp: float
     tax_rate: float
     cost_of_debt: float
     beta: float
-    # Growth
     g_stage_1: float
     g_stage_2: float
     perp_g: float
     exit_multiple: float
-    # market context
     live_price: float
     shares_outstanding: float
-    # Optional peer multiples for comps
     peer_pe: Optional[float] = None
     peer_ev_ebitda: Optional[float] = None
     peer_ps: Optional[float] = None
     revenue: Optional[float] = 0.0
     net_income: Optional[float] = 0.0
-    # Dividend model
     dividend_rate: Optional[float] = 0.0
 
 
@@ -354,7 +340,6 @@ def _clean(x):
 
 @api.post("/valuation")
 async def valuation(req: ValuationRequest):
-    # WACC
     mcap = req.live_price * req.shares_outstanding
     debt_pos = max(0.0, req.net_debt)
     total_cap = mcap + debt_pos
@@ -364,7 +349,6 @@ async def valuation(req: ValuationRequest):
     kd_at = req.cost_of_debt * (1 - req.tax_rate)
     wacc = w_e * ke + w_d * kd_at
 
-    # FCFF
     nopat = req.ebit * (1 - req.tax_rate)
     fcff = nopat + req.da - req.capex + req.nwc_change
     ebitda = req.ebit + req.da
@@ -374,7 +358,6 @@ async def valuation(req: ValuationRequest):
         req.shares_outstanding, req.net_debt, ebitda,
     )
 
-    # Reverse DCF — solve for implied g1
     def _price_for_g1(g1):
         _, ve, _, _ = _three_stage_dcf(
             fcff, wacc, g1, req.g_stage_2, req.perp_g, req.exit_multiple,
@@ -392,12 +375,10 @@ async def valuation(req: ValuationRequest):
             hi = mid
     implied_g = mid
 
-    # DDM (Gordon) — only meaningful if dividend > 0
     ddm_val = None
     if req.dividend_rate and req.dividend_rate > 0 and ke > req.perp_g:
         ddm_val = (req.dividend_rate * (1 + req.perp_g)) / (ke - req.perp_g)
 
-    # Multiples-based valuations
     multiples = {}
     if req.peer_pe and req.net_income and req.shares_outstanding:
         eps = req.net_income / req.shares_outstanding
@@ -408,7 +389,6 @@ async def valuation(req: ValuationRequest):
     if req.peer_ps and req.revenue and req.shares_outstanding:
         multiples["ps"] = (req.peer_ps * req.revenue) / req.shares_outstanding
 
-    # Weighted composite target
     components = []
     if _clean(v_exit) is not None:
         components.append(("DCF Exit Multiple", v_exit, 0.35))
@@ -502,12 +482,10 @@ async def montecarlo(req: MonteCarloRequest):
     trimmed = finite[(finite >= lo) & (finite <= hi)]
     p_under = float((trimmed > req.live_price).mean() * 100)
 
-    # VaR / CVaR on returns vs market price
     returns = (trimmed - req.live_price) / req.live_price
     var_95 = float(np.quantile(returns, 0.05))
     cvar_95 = float(returns[returns <= var_95].mean()) if (returns <= var_95).any() else var_95
 
-    # Histogram bins
     hist, edges = np.histogram(trimmed, bins=40)
     bins = [{"x": float((edges[i] + edges[i + 1]) / 2), "y": int(hist[i])} for i in range(len(hist))]
 
@@ -573,12 +551,15 @@ async def sensitivity(req: SensitivityRequest):
 
 
 # ------------------------------------------------------------------
-# 8. Peer Benchmarking
+# 8. Peer Benchmarking (ORA CON CACHE PER EVITARE 429)
 # ------------------------------------------------------------------
 @api.get("/peers/{ticker}")
 async def peers(ticker: str):
     ticker = ticker.upper().strip()
-    # Static curated peer map (free, no external calls) — fallback + curated for popular tickers
+    cached = _cache_get(f"peers:{ticker}")
+    if cached:
+        return cached
+
     peer_map = {
         "TSLA": ["F", "GM", "STLA", "TM", "NIO", "LI", "RIVN", "LCID"],
         "AAPL": ["MSFT", "GOOGL", "META", "AMZN", "SAMSUNG", "SONY"],
@@ -633,7 +614,6 @@ async def peers(ticker: str):
         except Exception:
             continue
 
-    # Median peer multiples (excluding target)
     peers_only = [r for r in rows if not r["is_target"]]
     def _median(key):
         vs = [r[key] for r in peers_only if r.get(key)]
@@ -647,7 +627,10 @@ async def peers(ticker: str):
         "profit_margin": _median("profit_margin"),
         "revenue_growth": _median("revenue_growth"),
     }
-    return {"rows": rows, "peer_medians": medians}
+    
+    payload = {"rows": rows, "peer_medians": medians}
+    _cache_set(f"peers:{ticker}", payload)
+    return payload
 
 
 # ------------------------------------------------------------------
@@ -674,7 +657,7 @@ class AIResearchRequest(BaseModel):
     beta: float
     prob_undervalued: Optional[float] = None
     var_95: Optional[float] = None
-    language: str = "it"  # "it" or "en"
+    language: str = "it"
 
 
 @api.post("/ai/research")
